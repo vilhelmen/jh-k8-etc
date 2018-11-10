@@ -1,0 +1,3 @@
+[submodule "ldapauthenticator"]
+	path = ldapauthenticator
+	url = https://github.com/vilhelmen/ldapauthenticator.git

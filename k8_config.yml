@@ -1,0 +1,41 @@
+hub:
+  image:
+    name: CUSTOM_HUB_IMAGE
+    tag: XXXX
+
+singleuser:
+  image:
+    name: SINGLEUSER_IMAGE
+    tag: XXXX
+
+auth:
+  type: 'ldap'
+  state:
+    enabled: true
+    cryptoKey: 'XXXXXXXXX'
+  ldap:
+    server:                   
+      host: 'XXXXXXXX'
+      port: 3268
+      ssl: false
+#    whitelistGroups: nil
+#    blacklistGroups: nil
+    adminGroups: ['CN=admins,DC=XXXX']
+    user:
+#      validRegex:
+      search:
+        base: ''
+        uid: 'sAMAccountName'
+        filter: '({username_attribute}={username})'
+        dn: 'CN=ldap_ro,CN=XXXXXXX'
+        password: 'XXXXXXXX'
+    profile:
+      enable: true
+      groups:
+        - 'CN=users,DC=XXXXXXX'
+        - 'CN=tas,DC=XXXXXXX'
+        - 'CN=adminsDC=XXXXXXXX'
+        - 'CN=instructors,DC=XXXXXX'
+      uid: 'uidNumber'
+      gid: 'gidNumber' # May be problematic! Should default to uidNumber to be safe because CERTAIN NODES are bad at ldap
+      groupName: 'cn'
