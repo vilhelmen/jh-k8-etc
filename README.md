@@ -2,7 +2,7 @@
 
 Initial proof of concept for various hub/k8 things for systems with existng homedirs, etc. No more 1000:100 for everyone!
 
-This readme is an attempt to document the changes made and why. This is based off like 8 jh repos, so I may have missed something in cleaning up and translating things.
+This readme is an attempt to document the changes made and why. This is based off like 8 jh repos, so I may have missed something in cleaning up and translating things. I promise it works, this version may just have typos.
 
 First, the hub. It pulls my custom ldap auth and sets up the `pre_spawn_hook`.
 
