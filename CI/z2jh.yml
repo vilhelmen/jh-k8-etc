@@ -1,0 +1,167 @@
+variables:
+# MANAGED BY RUNNER
+  # DOCKER_HOST: tcp://docker:2375
+  # DOCKER_DRIVER: overlay2
+  CACHE: "YES"
+
+.build_login:
+  image: docker:stable
+  retry: 2
+  tags:
+    - dind
+  variables:
+    REGISTRY_USER: gitlab-ci-token
+    REGISTRY_TOKEN: "$CI_JOB_TOKEN"
+  before_script:
+    - docker login -u $REGISTRY_USER -p $REGISTRY_TOKEN $CI_REGISTRY
+    - export IMAGE_PATH="${CI_REGISTRY}/${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}"
+    - export CONTAINER_IMAGE="${IMAGE_PATH}/${CONTAINER_NAME}"
+    - export CI_COMMIT_SHA_SHORT="${CI_COMMIT_SHA:0:8}"
+    - export CI_PARENT_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
+
+build_hub:
+  extends: .build_login
+  variables:
+    CONTAINER_NAME: hub
+    CONF_PATH: images/hub/
+  only:
+    changes:
+      - images/hub/**/*
+  except:
+    variables:
+      - $SHIM_REQ
+  script:
+    # Pull related images
+    - |
+      if [ "${CACHE}" = "YES" ]; then
+        docker pull ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} || true
+        docker pull ${CONTAINER_IMAGE}:${CI_PARENT_SHA_SHORT} || true
+        docker pull ${CONTAINER_IMAGE}:latest || true
+      fi
+    # Build hub
+    - |
+      echo 'docker build \' > image_build
+      if [ "${CACHE}" = "YES" ]; then
+        echo " --cache-from ${CONTAINER_IMAGE}:latest \\" >> image_build
+      else
+        echo " ${BUILD_CMD} --no-cache \\" >> image_build
+      fi
+
+      echo " --build-arg JUPYTERHUB_VERSION=0.9.4 --build-arg DEPLOY_USER=gitlab-ci-token --build-arg DEPLOY_KEY=${CI_JOB_TOKEN} \\" >> image_build
+      echo " --tag ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} --tag ${CONTAINER_IMAGE}:latest \\" >> image_build
+      echo " ${CONF_PATH}" >> image_build
+      
+      cat image_build
+    - . image_build
+    # Push image
+    - docker push ${CONTAINER_IMAGE}:latest
+
+# build_awaiter:
+#   extends: .build_login
+#   script:
+#     - echo No
+#   only:
+#     changes:
+#       - images/image-awaiter/**/*
+
+# build_network:
+#   extends: .build_login
+#   script:
+#     - echo No
+#   only:
+#     changes:
+#       - images/network-tools/**/*
+
+.trigger_pipeline:
+  image: ${CI_REGISTRY}/jupyter/util/util-container
+  variables:
+    # WTF gitlab, why does this not exist
+    CI_GITLAB_API_URL: https://XXXXXXXX.edu
+  before_script:
+    # - export IMAGE_PATH="${CI_REGISTRY}/${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}"
+    # NO REGISTRY!
+    - export IMAGE_PATH="${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}"
+    - export CONTAINER_IMAGE="${IMAGE_PATH}/${CONTAINER_NAME}"
+    - export CI_COMMIT_SHA_SHORT="${CI_COMMIT_SHA:0:8}"
+    # - export CI_PARENT_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
+  script:
+    - VAR_BLOB=$(echo '{"token":"'"${CI_JOB_TOKEN}"'", "ref":"'"${CI_COMMIT_REF_NAME}"'"}')
+
+    - VAR_BLOB=$(echo "$VAR_BLOB" | jq --compact-output '.variables += {"CACHE":"'"$CACHE"'"}')
+
+    - |
+      curl -X POST -H 'Content-Type: application/json' -d "${VAR_BLOB}" "${CI_GITLAB_API_URL}/api/v4/projects/${PROJECT_ID}/trigger/pipeline" | jq '.'
+
+
+trigger_stacks:
+  extends: .trigger_pipeline
+  only:
+    changes:
+      - images/singleuser-shim/**/*
+  except:
+    variables:
+      - $SHIM_REQ
+      - $NO_TRIGGER
+  variables:
+    # REPOSITORY: jupyter/docker-stacks
+    PROJECT_ID: 34
+
+trigger_helm_build:
+  extends: .trigger_pipeline
+  only:
+    changes:
+      - jupyterhub/**/*
+  except:
+    variables:
+      - $SHIM_REQ
+      - $NO_TRIGGER
+  variables:
+    # REPOSITORY: jupyter/helm-charts
+    PROJECT_ID: 46
+
+shim:
+  extends: .build_login
+  only:
+    variables:
+      - $SHIM_REQ == "YES"
+  variables:
+    TARGET_IMAGE: ${CI_REGISTRY}/${TARGET_IMAGE_PATH}
+    REGISTRY_USER: $JCI_USER
+    REGISTRY_TOKEN: $JCI_TOKEN
+  # artifacts:
+  #   paths:
+  #     - image_build
+  #   when: always
+  script:
+    # New shim who dis
+    - echo "${TARGET_IMAGE_PATH}"
+    # Pull related images
+    - |
+      if [ "${CACHE}" = "YES" ]; then
+        docker pull ${TARGET_IMAGE}:latest || true
+        docker pull ${TARGET_IMAGE}:latest-shim || true
+      fi
+      docker pull ${TARGET_IMAGE}:latest
+    # Build shim
+    - |
+      echo 'docker build \' > image_build
+      if [ "${CACHE}" = "YES" ]; then
+        echo " --cache-from ${TARGET_IMAGE}:latest-shim \\" >> image_build
+      else
+        echo ' --no-cache \' >> image_build
+      fi
+
+      if [ ! -z ${TARGET_IMAGE_LABEL+x} ]; then
+        echo " --build-arg IMAGE_LABEL='${TARGET_IMAGE_LABEL}' \\" >> image_build
+      fi
+
+      echo " --build-arg BASE_CONTAINER=${TARGET_IMAGE}:latest \\" >> image_build
+      echo " --tag ${TARGET_IMAGE}:${TARGET_IMAGE_HASH}-shim \\" >> image_build
+      echo " --tag ${TARGET_IMAGE}:latest-shim \\" >> image_build
+      echo ' images/singleuser-shim/' >> image_build
+      
+      cat image_build
+    - . image_build
+    # Push shim
+    - docker push ${TARGET_IMAGE}:${TARGET_IMAGE_HASH}-shim
+    - docker push ${TARGET_IMAGE}:latest-shim

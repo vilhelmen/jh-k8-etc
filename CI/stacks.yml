@@ -1,0 +1,805 @@
+variables:
+  GITLAB_HOST: https://XXXXXX.edu
+# MANAGED BY DIND-CACHE RUNNER
+#  DOCKER_HOST: tcp://docker:2375
+#  DOCKER_DRIVER: overlay2
+  CACHE: "YES"
+# HOLY SHIT GITLAB YOU CAN'T USE A GITLAB VARIABLE INSIDE A VARIABLE WHY.
+#  IMAGE_PATH: ${CI_REGISTRY}/${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}
+
+stages:
+  - L0 # Scheduling enforcement
+  - L1 # base
+  - L2 # minimal
+  - L3 # scipy / r
+  - L4 # TF (no) / datascience / pyspark
+  - L5 # allspark
+  - L75 # image scanning(?)
+  - L80 # Push latest tags
+  - L85 # Promote image
+  - L92 # trigger downstream pipelines
+  - L96 # Tag cleanup
+  - L98 # trigger next phase branch
+
+
+#  ____   ____ _   _ _____ ____  _   _ _     ___ _   _  ____ 
+# / ___| / ___| | | | ____|  _ \| | | | |   |_ _| \ | |/ ___|
+# \___ \| |   | |_| |  _| | | | | | | | |    | ||  \| | |  _ 
+#  ___) | |___|  _  | |___| |_| | |_| | |___ | || |\  | |_| |
+# |____/ \____|_| |_|_____|____/ \___/|_____|___|_| \_|\____|
+
+# There's no good way to do it short of restricting the workers to 1 job at a time, or using CI to trigger a work queue
+# and both or horrible.
+# So what this will do is query the API for the current repo and see if we're the lowest number'd id running
+# and hold until that is true.
+# With enough retries and a high enough timeout, it should be fineish :C
+
+scheduling:
+  stage: L0
+  image: ${CI_REGISTRY}/jupyter/util/util-container
+  retry: 2
+  script:
+    - |
+      printf 'Waiting...'
+      while true; do
+        READY=$(curl -sS --header "PRIVATE-TOKEN: ${JCI_TOKEN}" "${GITLAB_HOST}/api/v4/projects/${CI_PROJECT_ID}/pipelines?order_by=id&sort=asc&scope=running" | jq '.[0].id=='"${CI_PIPELINE_ID}")
+        if [ "${READY}" = "true" ]; then
+          printf '\nReady!\n'
+          exit 0
+        else
+          printf '.'
+          sleep 10
+        fi
+      done
+
+
+#  ____  _   _ ___ _     ____  
+# | __ )| | | |_ _| |   |  _ \ 
+# |  _ \| | | || || |   | | | |
+# | |_) | |_| || || |___| |_| |
+# |____/ \___/|___|_____|____/ 
+
+
+
+.build_login:
+  image: docker:stable
+  retry: 1
+  tags:
+    - dind
+  before_script:
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+    - export IMAGE_PATH="${CI_REGISTRY}/${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}"
+    - export CONTAINER_IMAGE="${IMAGE_PATH}/${CONTAINER_NAME}"
+    - |
+      if [ ! -z ${PARENT_IMAGE_PATH+x} ]; then
+        export PARENT_IMAGE="${CI_REGISTRY}/${PARENT_IMAGE_PATH}/${CI_COMMIT_REF_NAME}/${PARENT_NAME}"
+      else
+        export PARENT_IMAGE="${IMAGE_PATH}/${PARENT_NAME}"
+      fi
+    # If we're dev, cache from test. If prod, cache from dev. Saves space.
+    # Also prevents unexpected rebuilds (and potential differences!) when promoting images from dev to prod, etc
+    - |
+      if [ "${CI_COMMIT_REF_NAME}" = "prod" ]; then
+        export PREV_CYCLE_IMAGE_PATH="${CI_REGISTRY}/${CI_PROJECT_PATH}/test"
+      elif [ "${CI_COMMIT_REF_NAME}" = "test" ]; then
+        export PREV_CYCLE_IMAGE_PATH="${CI_REGISTRY}/${CI_PROJECT_PATH}/dev"
+      fi
+
+      if [ ! -z ${PREV_CYCLE_IMAGE_PATH+x} ]; then
+        export PREV_CYCLE_CONTAINER_IMAGE="${PREV_CYCLE_IMAGE_PATH}/${CONTAINER_NAME}"
+      fi
+    - export CI_COMMIT_SHA_SHORT="${CI_COMMIT_SHA:0:8}"
+    - export CI_COMMIT_BEFORE_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
+    - |
+      if [ ! -z ${PARENT_TAG+x} ]; then
+        export CI_PARENT_TAG="${PARENT_TAG}"
+      else
+        export CI_PARENT_TAG='latest'
+      fi
+
+
+.build:
+  extends: .build_login
+  script:
+    # Pull related images
+    - |
+      if [ "${CACHE}" = "YES" ]; then
+        docker pull ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} || true
+        docker pull ${CONTAINER_IMAGE}:${CI_PARENT_SHA_SHORT} || true
+        docker pull ${CONTAINER_IMAGE}:latest || true
+        #if [ ! -z ${PARENT_IMAGE+x} ]; then
+        #  docker pull ${PARENT_IMAGE}:${CI_PARENT_TAG} || true
+        #  docker pull ${PARENT_IMAGE}:latest || true
+        #fi
+
+        # Load previous cycle image
+        if [ ! -z ${PREV_CYCLE_CONTAINER_IMAGE+x} ]; then
+          docker pull ${PREV_CYCLE_CONTAINER_IMAGE}:latest || true
+        fi
+      fi
+      if [ ! -z ${PARENT_NAME+x} ]; then
+        docker pull ${PARENT_IMAGE}:${CI_PARENT_TAG}
+      fi
+    # Build main image
+    - |
+      echo 'docker build \' > image_build
+      if [ "${CACHE}" = "YES" ]; then
+        echo " --cache-from ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} \\" >> image_build
+        echo " --cache-from ${CONTAINER_IMAGE}:${CI_PARENT_SHA_SHORT} \\" >> image_build
+        echo " --cache-from ${CONTAINER_IMAGE}:latest \\" >> image_build
+        if [ ! -z ${PREV_CYCLE_CONTAINER_IMAGE+x} ]; then
+          echo "--cache-from ${PREV_CYCLE_CONTAINER_IMAGE}:latest \\" >> image_build
+        fi
+      else
+        echo ' --no-cache \' >> image_build
+      fi
+
+      if [ ! -z ${PARENT_NAME+x} ]; then
+        echo " --build-arg BASE_CONTAINER=${PARENT_IMAGE}:${CI_PARENT_TAG} \\" >> image_build
+      fi
+
+      echo " --tag ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} ${CONTAINER_PATH}/" >> image_build
+
+      cat image_build
+    - . image_build
+    # Push SHA tags
+    - docker push ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT}
+
+build_base:
+  stage: L1
+  extends: .build
+  variables:
+    CONTAINER_NAME: singleuser-base
+    CONTAINER_PATH: base-notebook
+
+.build_tf:
+  extends: .build_login
+  variables:
+    CONTAINER_NAME: singleuser-tf-base
+    PATCH_BASE: base-notebook
+    CONTAINER_BASE: nvidia/cuda:9.2-cudnn7-runtime-ubuntu16.04
+    TF_DEVICE: ''
+  script:
+    # Pull related images
+    - |
+      if [ "${CACHE}" = "YES" ]; then
+        docker pull ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} || true
+        docker pull ${CONTAINER_IMAGE}:${CI_PARENT_SHA_SHORT} || true
+        docker pull ${CONTAINER_IMAGE}:latest || true
+
+        # Load previous cycle image
+        if [ ! -z ${PREV_CYCLE_CONTAINER_IMAGE+x} ]; then
+          docker pull ${PREV_CYCLE_CONTAINER_IMAGE}:latest || true
+        fi
+      fi
+      docker pull ${CONTAINER_BASE}
+    # unpack base patch
+    - cp -r ${PATCH_BASE} nvidia-tensorflow/${PATCH_BASE}
+    - cd nvidia-tensorflow/${PATCH_BASE}/; patch -i ../${PATCH_BASE}.patch; cd -
+    # Build main image
+    - |
+      echo 'docker build \' > image_build
+      if [ "${CACHE}" = "YES" ]; then
+        echo " --cache-from ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} \\" >> image_build
+        echo " --cache-from ${CONTAINER_IMAGE}:${CI_PARENT_SHA_SHORT} \\" >> image_build
+        echo " --cache-from ${CONTAINER_IMAGE}:latest \\" >> image_build
+        if [ ! -z ${PREV_CYCLE_CONTAINER_IMAGE+x} ]; then
+          echo "--cache-from ${PREV_CYCLE_CONTAINER_IMAGE}:latest \\" >> image_build
+        fi
+      else
+        echo ' --no-cache \\' >> image_build
+      fi
+
+      echo " --build-arg BASE_CONTAINER=${CONTAINER_BASE} \\" >> image_build
+
+      echo " --build-arg TENSORFLOW_PKG=tensorflow${TF_DEVICE} \\" >> image_build
+
+      echo " --tag ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} nvidia-tensorflow/${PATCH_BASE}/" >> image_build
+
+      cat image_build
+    - . image_build
+    # Push SHA tags
+    - docker push ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT}
+
+build_base_tf_cpu:
+  stage: L1
+  extends: .build_tf
+  variables:
+    CONTAINER_BASE: ubuntu:16.04
+
+build_base_tf_gpu:
+  stage: L1
+  extends: .build_tf
+  variables:
+    TF_DEVICE: '-gpu'
+    CONTAINER_NAME: singleuser-tf-gpu-base
+
+minimal:
+  stage: L2
+  extends: .build
+  variables:
+    PARENT_NAME: singleuser-base
+    CONTAINER_NAME: singleuser-minimal
+    CONTAINER_PATH: minimal-notebook
+
+minimal_tf_cpu:
+  stage: L2
+  extends: .build
+  variables:
+    PARENT_NAME: singleuser-tf-base
+    CONTAINER_NAME: singleuser-tf-minimal
+    CONTAINER_PATH: minimal-notebook
+
+minimal_tf_gpu:
+  stage: L2
+  extends: .build
+  variables:
+    PARENT_NAME: singleuser-tf-gpu-base
+    CONTAINER_NAME: singleuser-tf-gpu-minimal
+    CONTAINER_PATH: minimal-notebook
+
+scipy:
+  stage: L3
+  extends: .build
+  variables:
+    PARENT_NAME: singleuser-minimal
+    CONTAINER_NAME: singleuser-scipy
+    CONTAINER_PATH: scipy-notebook
+
+scipy_tf_cpu:
+  stage: L3
+  extends: .build
+  variables:
+    PARENT_NAME: singleuser-tf-minimal
+    CONTAINER_NAME: singleuser-tf
+    CONTAINER_PATH: scipy-notebook
+
+scipy_tf_gpu:
+  stage: L3
+  extends: .build
+  variables:
+    PARENT_NAME: singleuser-tf-gpu-minimal
+    CONTAINER_NAME: singleuser-tf-gpu
+    CONTAINER_PATH: scipy-notebook
+
+r:
+  stage: L3
+  extends: .build
+  variables:
+    PARENT_NAME: singleuser-minimal
+    CONTAINER_NAME: singleuser-r
+    CONTAINER_PATH: r-notebook
+
+datascience:
+  stage: L4
+  extends: .build
+  variables:
+    PARENT_NAME: singleuser-scipy
+    CONTAINER_NAME: singleuser-datascience
+    CONTAINER_PATH: datascience-notebook
+
+pyspark:
+  stage: L4
+  extends: .build
+  variables:
+    PARENT_NAME: singleuser-scipy
+    CONTAINER_NAME: singleuser-pyspark
+    CONTAINER_PATH: pyspark-notebook
+
+allspark:
+  stage: L5
+  extends: .build
+  variables:
+    PARENT_NAME: singleuser-pyspark
+    CONTAINER_NAME: singleuser-allspark
+    CONTAINER_PATH: all-spark-notebook
+
+
+
+#  ____   ____    _    _   _ 
+# / ___| / ___|  / \  | \ | |
+# \___ \| |     / _ \ |  \| |
+#  ___) | |___ / ___ \| |\  |
+# |____/ \____/_/   \_\_| \_|
+
+# Gitlab can't comprehend more than one container in a repo
+# we'll just have to hope someone reads these files
+
+# We might be able to merge the reports BUT NO ONE WILL SAY WHAT THE FILE FORMAT IS AAAAAAAA
+
+# The report file format can't be merged without some effort, and it would be confusing if it was
+# There's no way in hell it's scanning python packages or anything, so I'm just going to shut it off for now
+
+# container_scanning:
+#   stage: L75
+#   extends: .build_login
+#   variables:
+#     CONTAINER_NAME: singleuser-minimal
+#   allow_failure: true
+#   script:
+#     - CI_APPLICATION_REPOSITORY=${CONTAINER_IMAGE}
+#     - CI_APPLICATION_TAG=${CI_COMMIT_SHA_SHORT}
+#     - docker run -d --name db arminc/clair-db:latest || true
+#     - docker run -p 6060:6060 --link db:postgres -d --name clair --restart on-failure arminc/clair-local-scan:v2.0.1 || true
+#     # WHY >:C
+#     - apk add -U wget ca-certificates
+#     - docker pull ${CI_APPLICATION_REPOSITORY}:${CI_APPLICATION_TAG}
+#     # Yeah, lets's just do this over and over forever.
+#     - wget https://github.com/arminc/clair-scanner/releases/download/v8/clair-scanner_linux_amd64
+#     - mv clair-scanner_linux_amd64 clair-scanner
+#     - chmod +x clair-scanner
+#     - touch clair-whitelist.yml
+#     - while( ! wget -q -O /dev/null http://docker:6060/v1/namespaces ) ; do sleep 1 ; done
+#     - retries=0
+#     - echo "Waiting for clair daemon to start"
+#     - while( ! wget -T 10 -q -O /dev/null http://docker:6060/v1/namespaces ) ; do sleep 1 ; echo -n "." ; if [ $retries -eq 10 ] ; then echo " Timeout, aborting." ; exit 1 ; fi ; retries=$(($retries+1)) ; done
+#     - ./clair-scanner -c http://docker:6060 --ip $(hostname -i) -r gl-container-scanning-report.json -l clair.log -w clair-whitelist.yml ${CI_APPLICATION_REPOSITORY}:${CI_APPLICATION_TAG} || true
+#   artifacts:
+#     paths:
+#       - gl-container-scanning-report.json
+#     reports:
+#       container_scanning: gl-container-scanning-report.json
+
+
+
+#  _____  _    ____ 
+# |_   _|/ \  / ___|
+#   | | / _ \| |  _ 
+#   | |/ ___ \ |_| |
+#   |_/_/   \_\____|
+
+
+# Words cannot express how much I hate the docker api
+.add_tag:
+  extends: .build_login
+  script:
+    - docker pull ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT}
+    - docker tag ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} ${CONTAINER_IMAGE}:${TARGET_TAG}
+    - docker push ${CONTAINER_IMAGE}:${TARGET_TAG}
+
+
+#  _____  _    ____     _        _  _____ _____ ____ _____ 
+# |_   _|/ \  / ___|   | |      / \|_   _| ____/ ___|_   _|
+#   | | / _ \| |  _    | |     / _ \ | | |  _| \___ \ | |  
+#   | |/ ___ \ |_| |   | |___ / ___ \| | | |___ ___) || |  
+#   |_/_/   \_\____|   |_____/_/   \_\_| |_____|____/ |_|  
+
+
+.add_latest_tag:
+  extends: .add_tag
+  stage: L80
+  variables:
+    TARGET_TAG: latest
+
+tag_base:
+  extends: .add_latest_tag
+  variables:
+    CONTAINER_NAME: singleuser-base
+
+tag_minimal:
+  extends: .add_latest_tag
+  variables:
+    CONTAINER_NAME: singleuser-minimal
+
+tag_scipy:
+  extends: .add_latest_tag
+  variables:
+    CONTAINER_NAME: singleuser-scipy
+
+tag_r:
+  extends: .add_latest_tag
+  variables:
+    CONTAINER_NAME: singleuser-r
+
+tag_datascience:
+  extends: .add_latest_tag
+  variables:
+    CONTAINER_NAME: singleuser-datascience
+
+tag_pyspark:
+  extends: .add_latest_tag
+  variables:
+    CONTAINER_NAME: singleuser-pyspark
+
+tag_allspark:
+  extends: .add_latest_tag
+  variables:
+    CONTAINER_NAME: singleuser-allspark
+
+tag_tf_cpu:
+  extends: .add_latest_tag
+  variables:
+    CONTAINER_NAME: singleuser-tf
+
+tag_tf_cpu_base:
+  extends: .add_latest_tag
+  variables:
+    CONTAINER_NAME: singleuser-tf-base
+
+tag_tf_cpu_minimal:
+  extends: .add_latest_tag
+  variables:
+    CONTAINER_NAME: singleuser-tf-minimal
+
+tag_tf_gpu:
+  extends: .add_latest_tag
+  variables:
+    CONTAINER_NAME: singleuser-tf-gpu
+
+tag_tf_gpu_base:
+  extends: .add_latest_tag
+  variables:
+    CONTAINER_NAME: singleuser-tf-gpu-base
+
+tag_tf_gpu_minimal:
+  extends: .add_latest_tag
+  variables:
+    CONTAINER_NAME: singleuser-tf-gpu-minimal
+
+
+#  _____  _    ____     ____ _____  _    ____  _     _____ 
+# |_   _|/ \  / ___|   / ___|_   _|/ \  | __ )| |   | ____|
+#   | | / _ \| |  _    \___ \ | | / _ \ |  _ \| |   |  _|  
+#   | |/ ___ \ |_| |    ___) || |/ ___ \| |_) | |___| |___ 
+#   |_/_/   \_\____|   |____/ |_/_/   \_\____/|_____|_____|
+
+
+.promote_tag:
+  extends: .add_tag
+  stage: L85
+  when: manual
+  # Allows this to be skipped over when set to manual
+  allow_failure: true
+  only:
+    refs:
+      - test
+  variables:
+    TARGET_TAG: stable
+
+
+
+promote_base:
+  extends: .promote_tag
+  variables:
+    CONTAINER_NAME: singleuser-base
+
+promote_minimal:
+  extends: .promote_tag
+  variables:
+    CONTAINER_NAME: singleuser-minimal
+
+promote_scipy:
+  extends: .promote_tag
+  variables:
+    CONTAINER_NAME: singleuser-scipy
+
+promote_r:
+  extends: .promote_tag
+  variables:
+    CONTAINER_NAME: singleuser-r
+
+promote_datascience:
+  extends: .promote_tag
+  variables:
+    CONTAINER_NAME: singleuser-datascience
+
+promote_pyspark:
+  extends: .promote_tag
+  variables:
+    CONTAINER_NAME: singleuser-pyspark
+
+promote_allspark:
+  extends: .promote_tag
+  variables:
+    CONTAINER_NAME: singleuser-allspark
+
+promote_tf_cpu:
+  extends: .promote_tag
+  variables:
+    CONTAINER_NAME: singleuser-tf
+
+promote_tf_cpu_base:
+  extends: .promote_tag
+  variables:
+    CONTAINER_NAME: singleuser-tf-base
+
+promote_tf_cpu_minimal:
+  extends: .promote_tag
+  variables:
+    CONTAINER_NAME: singleuser-tf-minimal
+
+promote_tf_gpu:
+  extends: .promote_tag
+  variables:
+    CONTAINER_NAME: singleuser-tf-gpu
+
+promote_tf_gpu_base:
+  extends: .promote_tag
+  variables:
+    CONTAINER_NAME: singleuser-tf-gpu-base
+
+promote_tf_gpu_minimal:
+  extends: .promote_tag
+  variables:
+    CONTAINER_NAME: singleuser-tf-gpu-minimal
+
+
+
+#   ____ _     _____    _    _   _ 
+#  / ___| |   | ____|  / \  | \ | |
+# | |   | |   |  _|   / _ \ |  \| |
+# | |___| |___| |___ / ___ \| |\  |
+#  \____|_____|_____/_/   \_\_| \_|
+
+# note this won't delete it from the dind cache.
+# I could, but that would be another stage with the docker container since it doesn't have jq
+# ... I suppose the utility container could have docker
+
+# purges all hash-like tags and their shims
+
+.clean_tags:
+  stage: L96
+  image: ${CI_REGISTRY}/jupyter/util/util-container
+  allow_failure: true
+  before_script:
+    - export IMAGE_PATH="${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}"
+    - export CONTAINER_IMAGE="${IMAGE_PATH}/${CONTAINER_NAME}"
+  script:
+    - |
+      BASIC_AUTH=$(printf "${JCI_USER}:${JCI_TOKEN}" | base64)
+      THRESHOLD=$(date --date='today-3weeks' +%s)
+
+      echo "Processing ${CONTAINER_IMAGE}..."
+
+      REPO_TOKEN=$(curl -sS --fail "${GITLAB_HOST}/jwt/auth?service=container_registry&scope=repository:${CONTAINER_IMAGE}:*&client_id=ci" -H "Authorization: Basic ${BASIC_AUTH}" | jq -r .token)
+
+      echo "Loading tags..."
+
+      TAGS=($(curl -sS --fail "https://${CI_REGISTRY}/v2/${CONTAINER_IMAGE}/tags/list" -H "Authorization: Bearer ${REPO_TOKEN}" | { grep '\"tags\"\:\[' || true; } | jq -r '.tags[]' | { grep -E '[0-9a-f]{8}(-shim)?' || true; }))
+
+      for TAG in "${TAGS[@]}"; do
+        echo "Processing ${CONTAINER_IMAGE}:${TAG}..."
+
+        CREATION_DATE=$(curl -sS --fail "https://${CI_REGISTRY}/v2/${CONTAINER_IMAGE}/manifests/${TAG}" -H "Authorization: Bearer $REPO_TOKEN" | jq -r '.history[0].v1Compatibility' | jq -r '.created')
+
+        if [[ "$(date -d ${CREATION_DATE} +%s)" -le "${THRESHOLD}" ]]; then
+          echo "Deleting ${CONTAINER_IMAGE}:${TAG}..."
+          digest=$(curl -sS --fail -I -X GET "https://${CI_REGISTRY}/v2/${CONTAINER_IMAGE}/manifests/${TAG}" -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' -H "Authorization: Bearer ${REPO_TOKEN}" | grep 'Digest' | cut -d ' ' -f 2)
+          digest=${digest::71}
+          echo "${CI_REGISTRY}/v2/$CONTAINER_IMAGE/manifests/$digest"
+          curl -X DELETE -sS --fail "https://${CI_REGISTRY}/v2/${CONTAINER_IMAGE}/manifests/$digest" -H "Authorization: Bearer ${REPO_TOKEN}"
+        else
+          echo "Image not marked for deletion"
+        fi
+      done
+
+
+clean_base:
+  extends: .clean_tags
+  variables:
+    CONTAINER_NAME: singleuser-base
+
+clean_base_tf_cpu:
+  extends: .clean_tags
+  variables:
+    CONTAINER_NAME: singleuser-tf-base
+
+clean_base_tf_gpu:
+  extends: .clean_tags
+  variables:
+    CONTAINER_NAME: singleuser-tf-gpu-base
+
+clean_minimal:
+  extends: .clean_tags
+  variables:
+    CONTAINER_NAME: singleuser-minimal
+
+clean_minimal_tf_cpu:
+  extends: .clean_tags
+  variables:
+    CONTAINER_NAME: singleuser-tf-minimal
+
+clean_minimal_tf_gpu:
+  extends: .clean_tags
+  variables:
+    CONTAINER_NAME: singleuser-tf-gpu-minimal
+
+clean_scipy:
+  extends: .clean_tags
+  variables:
+    CONTAINER_NAME: singleuser-scipy
+
+clean_scipy_tf_cpu:
+  extends: .clean_tags
+  variables:
+    CONTAINER_NAME: singleuser-tf
+
+clean_scipy_tf_gpu:
+  extends: .clean_tags
+  variables:
+    CONTAINER_NAME: singleuser-tf-gpu
+
+clean_r:
+  extends: .clean_tags
+  variables:
+    CONTAINER_NAME: singleuser-r
+
+clean_datascience:
+  extends: .clean_tags
+  variables:
+    CONTAINER_NAME: singleuser-datascience
+
+clean_pyspark:
+  extends: .clean_tags
+  variables:
+    CONTAINER_NAME: singleuser-pyspark
+
+clean_allspark:
+  extends: .clean_tags
+  variables:
+    CONTAINER_NAME: singleuser-allspark
+
+
+#  ____  _   _ ___ __  __ 
+# / ___|| | | |_ _|  \/  |
+# \___ \| |_| || || |\/| |
+#  ___) |  _  || || |  | |
+# |____/|_| |_|___|_|  |_|
+
+
+.shim_trigger:
+  stage: L92
+  image: ${CI_REGISTRY}/jupyter/util/util-container
+  variables:
+    # WTF gitlab, why does this not exist
+    CI_GITLAB_API_URL: https://XXXXX.edu
+    PROJECT_ID: 33
+    IMAGE_LABEL: "UNLABELD CONTAINER IMAGE 🚱"
+  before_script:
+    - export CONTAINER_IMAGE="${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}/${CONTAINER_NAME}"
+    - export CI_COMMIT_SHA_SHORT="${CI_COMMIT_SHA:0:8}"
+    # - export CI_PARENT_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
+  script:
+    - VAR_BLOB=$(echo '{"token":"'"${CI_JOB_TOKEN}"'", "ref":"'"${CI_COMMIT_REF_NAME}"'"}')
+
+    - VAR_BLOB=$(echo "$VAR_BLOB" | jq --compact-output '.variables += {"CACHE":"'"$CACHE"'"}')
+
+    - VAR_BLOB=$(echo "$VAR_BLOB" | jq --compact-output '.variables += {"SHIM_REQ":"YES"}')
+
+    - |
+      if [ -z ${CONTAINER_NAME+x} ]; then
+        echo "No image specified??????????????"
+        exit 1
+      else
+        VAR_BLOB=$(echo "$VAR_BLOB" | jq --compact-output '.variables += {"TARGET_IMAGE_PATH":"'"${CONTAINER_IMAGE}"'"}')
+      fi
+
+    - VAR_BLOB=$(echo "$VAR_BLOB" | jq --compact-output '.variables += {"TARGET_IMAGE_HASH":"'"${CI_COMMIT_SHA_SHORT}"'"}')
+    - |
+      if [ ! -z ${IMAGE_LABEL+x} ]; then
+        VAR_BLOB=$(echo "$VAR_BLOB" | jq --compact-output '.variables += {"TARGET_IMAGE_LABEL":"'"${IMAGE_LABEL}"'"}')
+      fi
+
+    - |
+      echo "${VAR_BLOB}"
+      curl -X POST -H 'Content-Type: application/json' -d "${VAR_BLOB}" "${CI_GITLAB_API_URL}/api/v4/projects/${PROJECT_ID}/trigger/pipeline" | jq '.'
+
+
+shim_minimal:
+  extends: .shim_trigger
+  variables:
+    CONTAINER_NAME: singleuser-minimal
+    IMAGE_LABEL: "Minimal"
+
+shim_scipy:
+  extends: .shim_trigger
+  variables:
+    CONTAINER_NAME: singleuser-scipy
+    IMAGE_LABEL: "Scipy"
+
+shim_r:
+  extends: .shim_trigger
+  variables:
+    CONTAINER_NAME: singleuser-r
+    IMAGE_LABEL: "R"
+
+shim_datascience:
+  extends: .shim_trigger
+  variables:
+    CONTAINER_NAME: singleuser-datascience
+    IMAGE_LABEL: "Data Science"
+
+shim_allspark:
+  extends: .shim_trigger
+  variables:
+    CONTAINER_NAME: singleuser-allspark
+    IMAGE_LABEL: "Allspark"
+
+shim_tf_cpu:
+  extends: .shim_trigger
+  variables:
+    CONTAINER_NAME: singleuser-tf
+    IMAGE_LABEL: "Tensorflow CPU"
+
+shim_tf_gpu:
+  extends: .shim_trigger
+  variables:
+    CONTAINER_NAME: singleuser-tf-gpu
+    IMAGE_LABEL: "Tensorflow GPU"
+
+
+#  _____ ____  ___ ____  ____ _____ ____     _   _ _______  _______ 
+# |_   _|  _ \|_ _/ ___|/ ___| ____|  _ \   | \ | | ____\ \/ /_   _|
+#   | | | |_) || | |  _| |  _|  _| | |_) |  |  \| |  _|  \  /  | |  
+#   | | |  _ < | | |_| | |_| | |___|  _ <   | |\  | |___ /  \  | |  
+#   |_| |_| \_\___\____|\____|_____|_| \_\  |_| \_|_____/_/\_\ |_|  
+
+
+
+.trigger_pipeline:
+  image: ${CI_REGISTRY}/jupyter/util/util-container
+  variables:
+    # WTF gitlab, why does this not exist
+    CI_GITLAB_API_URL: https://XXXXXX.edu
+  before_script:
+    # - export IMAGE_PATH="${CI_REGISTRY}/${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}"
+    # NO REGISTRY!
+    - export IMAGE_PATH="${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}"
+    - export CONTAINER_IMAGE="${IMAGE_PATH}/${CONTAINER_NAME}"
+    - export CI_COMMIT_SHA_SHORT="${CI_COMMIT_SHA:0:8}"
+    # - export CI_PARENT_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
+  script:
+    - VAR_BLOB=$(echo '{"token":"'"${CI_JOB_TOKEN}"'", "ref":"'"${CI_COMMIT_REF_NAME}"'"}')
+
+    - VAR_BLOB=$(echo "$VAR_BLOB" | jq --compact-output '.variables += {"CACHE":"'"$CACHE"'"}')
+
+    - |
+      curl -X POST -H 'Content-Type: application/json' -d "${VAR_BLOB}" "${CI_GITLAB_API_URL}/api/v4/projects/${PROJECT_ID}/trigger/pipeline" | jq '.'
+
+
+trigger_courses:
+  stage: L98
+  extends: .trigger_pipeline
+  except:
+    variables:
+      - $NO_TRIGGER
+  variables:
+    # REPOSITORY: jupyter/course-containers
+    PROJECT_ID: 50
+
+
+
+# trigger_next_branch:
+#   stage: L98
+#   image: ${CI_REGISTRY}/jupyter/util/util-container
+#   variables:
+#     # WTF gitlab, why does this not exist
+#     CI_GITLAB_API_URL: https://XXXXXX.edu
+#     # REPOSITORY: jupyter/docker-stacks
+#     PROJECT_ID: 34
+#   when: manual
+#   allow_failure: true
+#   before_script:
+#     # - export IMAGE_PATH="${CI_REGISTRY}/${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}"
+#     # NO REGISTRY!
+#     - export IMAGE_PATH="${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}"
+#     - export CONTAINER_IMAGE="${IMAGE_PATH}/${CONTAINER_NAME}"
+#     - export CI_COMMIT_SHA_SHORT="${CI_COMMIT_SHA:0:8}"
+#     # - export CI_PARENT_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
+#   script:
+#     - |
+#       if [ "${CI_COMMIT_REF_NAME}" = "test" ]; then
+#         export TARGET_CYCLE="prod"
+#       elif [ "${CI_COMMIT_REF_NAME}" = "dev" ]; then
+#         export TARGET_CYCLE="test"
+#       else
+#         echo "Nothing to do!"
+#         exit 0
+#       fi
+
+#     - VAR_BLOB=$(echo '{"token":"'"${CI_JOB_TOKEN}"'", "ref":"'"${TARGET_CYCLE}"'"}')
+
+#     - VAR_BLOB=$(echo "$VAR_BLOB" | jq --compact-output '.variables += {"CACHE":"'"$CACHE"'"}')
+
+#     - |
+#       curl -X POST -H 'Content-Type: application/json' -d "${VAR_BLOB}" "${CI_GITLAB_API_URL}/api/v4/projects/${PROJECT_ID}/trigger/pipeline" | jq '.'

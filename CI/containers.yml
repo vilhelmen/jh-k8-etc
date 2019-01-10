@@ -1,0 +1,412 @@
+variables:
+  GITLAB_HOST: https://XXXXXX.edu
+# MANAGED BY DIND-CACHE RUNNER
+#  DOCKER_HOST: tcp://docker:2375
+#  DOCKER_DRIVER: overlay2
+  CACHE: "YES"
+# HOLY SHIT GITLAB YOU CAN'T USE A GITLAB VARIABLE INSIDE A VARIABLE WHY.
+#  IMAGE_PATH: ${CI_REGISTRY}/${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}
+
+stages:
+  - L0 # Scheduling enforcement
+  - L2 # Whatever!
+  - L75 # image scanning(?)
+  - L80 # Push latest tags
+  - L85 # Promote image
+  - L92 # trigger downstream pipelines
+  - L96 # Tag cleanup
+  - L98 # trigger next phase branch
+
+
+#  ____   ____ _   _ _____ ____  _   _ _     ___ _   _  ____ 
+# / ___| / ___| | | | ____|  _ \| | | | |   |_ _| \ | |/ ___|
+# \___ \| |   | |_| |  _| | | | | | | | |    | ||  \| | |  _ 
+#  ___) | |___|  _  | |___| |_| | |_| | |___ | || |\  | |_| |
+# |____/ \____|_| |_|_____|____/ \___/|_____|___|_| \_|\____|
+
+# There's no good way to do it short of restricting the workers to 1 job at a time, or using CI to trigger a work queue
+# and both or horrible.
+# So what this will do is query the API for the current repo and see if we're the lowest number'd id running
+# and hold until that is true.
+# With enough retries and a high enough timeout, it should be fineish :C
+
+scheduling:
+  stage: L0
+  image: ${CI_REGISTRY}/jupyter/util/util-container
+  retry: 2
+  script:
+    - |
+      printf 'Waiting...'
+      while true; do
+        READY=$(curl -sS --header "PRIVATE-TOKEN: ${JCI_TOKEN}" "${GITLAB_HOST}/api/v4/projects/${CI_PROJECT_ID}/pipelines?order_by=id&sort=asc&scope=running" | jq '.[0].id=='"${CI_PIPELINE_ID}")
+        if [ "${READY}" = "true" ]; then
+          printf '\nReady!\n'
+          exit 0
+        else
+          printf '.'
+          sleep 10
+        fi
+      done
+
+
+#  ____  _   _ ___ _     ____  
+# | __ )| | | |_ _| |   |  _ \ 
+# |  _ \| | | || || |   | | | |
+# | |_) | |_| || || |___| |_| |
+# |____/ \___/|___|_____|____/ 
+
+
+# For building with a remote parent (read: docker-stacks)
+# Set the PARENT_IMAGE_PATH to the repo (jupyter/docker-stacks)
+# Optionally set PARENT_TAG to the hash of the parent image to use, else it will be "latest"
+# Don't forget to set parent-name
+
+.build_login:
+  image: docker:stable
+  retry: 1
+  tags:
+    - dind
+  before_script:
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+    - export IMAGE_PATH="${CI_REGISTRY}/${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}"
+    - export CONTAINER_IMAGE="${IMAGE_PATH}/${CONTAINER_NAME}"
+    - |
+      if [ ! -z ${PARENT_IMAGE_PATH+x} ]; then
+        export PARENT_IMAGE="${CI_REGISTRY}/${PARENT_IMAGE_PATH}/${CI_COMMIT_REF_NAME}/${PARENT_NAME}"
+      else
+        export PARENT_IMAGE="${IMAGE_PATH}/${PARENT_NAME}"
+      fi
+    # If we're dev, cache from test. If prod, cache from dev. Saves space.
+    # Also prevents unexpected rebuilds (and potential differences!) when promoting images from dev to prod, etc
+    - |
+      if [ "${CI_COMMIT_REF_NAME}" = "prod" ]; then
+        export PREV_CYCLE_IMAGE_PATH="${CI_REGISTRY}/${CI_PROJECT_PATH}/test"
+      elif [ "${CI_COMMIT_REF_NAME}" = "test" ]; then
+        export PREV_CYCLE_IMAGE_PATH="${CI_REGISTRY}/${CI_PROJECT_PATH}/dev"
+      fi
+
+      if [ ! -z ${PREV_CYCLE_IMAGE_PATH+x} ]; then
+        export PREV_CYCLE_CONTAINER_IMAGE="${PREV_CYCLE_IMAGE_PATH}/${CONTAINER_NAME}"
+      fi
+    - export CI_COMMIT_SHA_SHORT="${CI_COMMIT_SHA:0:8}"
+    - export CI_COMMIT_BEFORE_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
+    - |
+      if [ ! -z ${PARENT_TAG+x} ]; then
+        export CI_PARENT_TAG="${PARENT_TAG}"
+      else
+        export CI_PARENT_TAG='latest'
+      fi
+
+
+.build:
+  extends: .build_login
+  script:
+    # Pull related images
+    - |
+      if [ "${CACHE}" = "YES" ]; then
+        docker pull ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} || true
+        docker pull ${CONTAINER_IMAGE}:${CI_COMMIT_BEFORE_SHA_SHORT} || true
+        docker pull ${CONTAINER_IMAGE}:latest || true
+        #if [ ! -z ${PARENT_IMAGE+x} ]; then
+        #  docker pull ${PARENT_IMAGE}:${CI_PARENT_TAG} || true
+        #  docker pull ${PARENT_IMAGE}:latest || true
+        #fi
+
+        # Load previous cycle image
+        if [ ! -z ${PREV_CYCLE_CONTAINER_IMAGE+x} ]; then
+          docker pull ${PREV_CYCLE_CONTAINER_IMAGE}:latest || true
+        fi
+      fi
+      if [ ! -z ${PARENT_NAME+x} ]; then
+        docker pull ${PARENT_IMAGE}:${CI_PARENT_TAG}
+      fi
+    # Build main image
+    - |
+      echo 'docker build \' > image_build
+      if [ "${CACHE}" = "YES" ]; then
+        echo " --cache-from ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} \\" >> image_build
+        echo " --cache-from ${CONTAINER_IMAGE}:${CI_COMMIT_BEFORE_SHA_SHORT} \\" >> image_build
+        echo " --cache-from ${CONTAINER_IMAGE}:latest \\" >> image_build
+        if [ ! -z ${PREV_CYCLE_CONTAINER_IMAGE+x} ]; then
+          echo "--cache-from ${PREV_CYCLE_CONTAINER_IMAGE}:latest \\" >> image_build
+        fi
+      else
+        echo ' --no-cache \' >> image_build
+      fi
+
+      if [ ! -z ${PARENT_NAME+x} ]; then
+        echo " --build-arg BASE_CONTAINER=${PARENT_IMAGE}:${CI_PARENT_TAG} \\" >> image_build
+      fi
+
+      echo " --tag ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} ${CONTAINER_PATH}/" >> image_build
+
+      cat image_build
+    - . image_build
+    # Push SHA tags
+    - docker push ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT}
+
+build_dataviz:
+  stage: L2
+  extends: .build
+  variables:
+    PARENT_NAME: singleuser-datascience
+    PARENT_IMAGE_PATH: jupyter/docker-stacks
+    CONTAINER_NAME: singleuser-dataviz
+    CONTAINER_PATH: mudsa-vis
+
+
+#  ____   ____    _    _   _ 
+# / ___| / ___|  / \  | \ | |
+# \___ \| |     / _ \ |  \| |
+#  ___) | |___ / ___ \| |\  |
+# |____/ \____/_/   \_\_| \_|
+
+# Gitlab can't comprehend more than one container in a repo
+# we'll just have to hope someone reads these files
+
+# We might be able to merge the reports BUT NO ONE WILL SAY WHAT THE FILE FORMAT IS AAAAAAAA
+
+# The report file format can't be merged without some effort, and it would be confusing if it was
+# There's no way in hell it's scanning python packages or anything, so I'm just going to shut it off for now
+
+# container_scanning:
+#   stage: L75
+#   extends: .build_login
+#   variables:
+#     CONTAINER_NAME: singleuser-minimal
+#   allow_failure: true
+#   script:
+#     - CI_APPLICATION_REPOSITORY=${CONTAINER_IMAGE}
+#     - CI_APPLICATION_TAG=${CI_COMMIT_SHA_SHORT}
+#     - docker run -d --name db arminc/clair-db:latest || true
+#     - docker run -p 6060:6060 --link db:postgres -d --name clair --restart on-failure arminc/clair-local-scan:v2.0.1 || true
+#     # WHY >:C
+#     - apk add -U wget ca-certificates
+#     - docker pull ${CI_APPLICATION_REPOSITORY}:${CI_APPLICATION_TAG}
+#     # Yeah, lets's just do this over and over forever.
+#     - wget https://github.com/arminc/clair-scanner/releases/download/v8/clair-scanner_linux_amd64
+#     - mv clair-scanner_linux_amd64 clair-scanner
+#     - chmod +x clair-scanner
+#     - touch clair-whitelist.yml
+#     - while( ! wget -q -O /dev/null http://docker:6060/v1/namespaces ) ; do sleep 1 ; done
+#     - retries=0
+#     - echo "Waiting for clair daemon to start"
+#     - while( ! wget -T 10 -q -O /dev/null http://docker:6060/v1/namespaces ) ; do sleep 1 ; echo -n "." ; if [ $retries -eq 10 ] ; then echo " Timeout, aborting." ; exit 1 ; fi ; retries=$(($retries+1)) ; done
+#     - ./clair-scanner -c http://docker:6060 --ip $(hostname -i) -r gl-container-scanning-report.json -l clair.log -w clair-whitelist.yml ${CI_APPLICATION_REPOSITORY}:${CI_APPLICATION_TAG} || true
+#   artifacts:
+#     paths:
+#       - gl-container-scanning-report.json
+#     reports:
+#       container_scanning: gl-container-scanning-report.json
+
+
+
+#  _____  _    ____ 
+# |_   _|/ \  / ___|
+#   | | / _ \| |  _ 
+#   | |/ ___ \ |_| |
+#   |_/_/   \_\____|
+
+
+# Words cannot express how much I hate the docker api
+.add_tag:
+  extends: .build_login
+  script:
+    - docker pull ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT}
+    - docker tag ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} ${CONTAINER_IMAGE}:${TARGET_TAG}
+    - docker push ${CONTAINER_IMAGE}:${TARGET_TAG}
+
+
+#  _____  _    ____     _        _  _____ _____ ____ _____ 
+# |_   _|/ \  / ___|   | |      / \|_   _| ____/ ___|_   _|
+#   | | / _ \| |  _    | |     / _ \ | | |  _| \___ \ | |  
+#   | |/ ___ \ |_| |   | |___ / ___ \| | | |___ ___) || |  
+#   |_/_/   \_\____|   |_____/_/   \_\_| |_____|____/ |_|  
+
+
+.add_latest_tag:
+  extends: .add_tag
+  stage: L80
+  variables:
+    TARGET_TAG: latest
+
+tag_dataviz:
+  extends: .add_latest_tag
+  variables:
+    CONTAINER_NAME: singleuser-dataviz
+
+
+#  _____  _    ____     ____ _____  _    ____  _     _____ 
+# |_   _|/ \  / ___|   / ___|_   _|/ \  | __ )| |   | ____|
+#   | | / _ \| |  _    \___ \ | | / _ \ |  _ \| |   |  _|  
+#   | |/ ___ \ |_| |    ___) || |/ ___ \| |_) | |___| |___ 
+#   |_/_/   \_\____|   |____/ |_/_/   \_\____/|_____|_____|
+
+
+.promote_tag:
+  extends: .add_tag
+  stage: L85
+  when: manual
+  # Allows this to be skipped over when set to manual
+  allow_failure: true
+  only:
+    refs:
+      - test
+  variables:
+    TARGET_TAG: stable
+
+
+promote_dataviz:
+  extends: .promote_tag
+  variables:
+    CONTAINER_NAME: singleuser-dataviz
+
+
+#   ____ _     _____    _    _   _ 
+#  / ___| |   | ____|  / \  | \ | |
+# | |   | |   |  _|   / _ \ |  \| |
+# | |___| |___| |___ / ___ \| |\  |
+#  \____|_____|_____/_/   \_\_| \_|
+
+# note this won't delete it from the dind cache.
+# I could, but that would be another stage with the docker container since it doesn't have jq
+# ... I suppose the utility container could have docker
+
+# purges all hash-like tags and their shims
+
+.clean_tags:
+  stage: L96
+  image: ${CI_REGISTRY}/jupyter/util/util-container
+  allow_failure: true
+  before_script:
+    - export IMAGE_PATH="${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}"
+    - export CONTAINER_IMAGE="${IMAGE_PATH}/${CONTAINER_NAME}"
+  script:
+    - |
+      BASIC_AUTH=$(printf "${JCI_USER}:${JCI_TOKEN}" | base64)
+      THRESHOLD=$(date --date='today-3weeks' +%s)
+
+      echo "Processing ${CONTAINER_IMAGE}..."
+
+      REPO_TOKEN=$(curl -sS --fail "${GITLAB_HOST}/jwt/auth?service=container_registry&scope=repository:${CONTAINER_IMAGE}:*&client_id=ci" -H "Authorization: Basic ${BASIC_AUTH}" | jq -r .token)
+
+      echo "Loading tags..."
+
+      TAGS=($(curl -sS --fail "https://${CI_REGISTRY}/v2/${CONTAINER_IMAGE}/tags/list" -H "Authorization: Bearer ${REPO_TOKEN}" | { grep '\"tags\"\:\[' || true; } | jq -r '.tags[]' | { grep -E '[0-9a-f]{8}(-shim)?' || true; }))
+
+      for TAG in "${TAGS[@]}"; do
+        echo "Processing ${CONTAINER_IMAGE}:${TAG}..."
+
+        CREATION_DATE=$(curl -sS --fail "https://${CI_REGISTRY}/v2/${CONTAINER_IMAGE}/manifests/${TAG}" -H "Authorization: Bearer $REPO_TOKEN" | jq -r '.history[0].v1Compatibility' | jq -r '.created')
+
+        if [[ "$(date -d ${CREATION_DATE} +%s)" -le "${THRESHOLD}" ]]; then
+          echo "Deleting ${CONTAINER_IMAGE}:${TAG}..."
+          digest=$(curl -sS --fail -I -X GET "https://${CI_REGISTRY}/v2/${CONTAINER_IMAGE}/manifests/${TAG}" -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' -H "Authorization: Bearer ${REPO_TOKEN}" | grep 'Digest' | cut -d ' ' -f 2)
+          digest=${digest::71}
+          echo "${CI_REGISTRY}/v2/$CONTAINER_IMAGE/manifests/$digest"
+          curl -X DELETE -sS --fail "https://${CI_REGISTRY}/v2/${CONTAINER_IMAGE}/manifests/$digest" -H "Authorization: Bearer ${REPO_TOKEN}"
+        else
+          echo "Image not marked for deletion"
+        fi
+      done
+
+
+clean_dataviz:
+  extends: .clean_tags
+  variables:
+    CONTAINER_NAME: singleuser-dataviz
+
+
+#  ____  _   _ ___ __  __ 
+# / ___|| | | |_ _|  \/  |
+# \___ \| |_| || || |\/| |
+#  ___) |  _  || || |  | |
+# |____/|_| |_|___|_|  |_|
+
+
+.shim_trigger:
+  stage: L92
+  image: ${CI_REGISTRY}/jupyter/util/util-container
+  variables:
+    # WTF gitlab, why does this not exist
+    CI_GITLAB_API_URL: https://XXXXX.edu
+    PROJECT_ID: 33
+    # IMAGE_LABEL: "UNLABELD CONTAINER IMAGE 🚱"
+  before_script:
+    - export CONTAINER_IMAGE="${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}/${CONTAINER_NAME}"
+    - export CI_COMMIT_SHA_SHORT="${CI_COMMIT_SHA:0:8}"
+    # - export CI_COMMIT_BEFORE_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
+  script:
+    - VAR_BLOB=$(echo '{"token":"'"${CI_JOB_TOKEN}"'", "ref":"'"${CI_COMMIT_REF_NAME}"'"}')
+
+    - VAR_BLOB=$(echo "$VAR_BLOB" | jq --compact-output '.variables += {"CACHE":"'"$CACHE"'"}')
+
+    - VAR_BLOB=$(echo "$VAR_BLOB" | jq --compact-output '.variables += {"SHIM_REQ":"YES"}')
+
+    - |
+      if [ -z ${CONTAINER_NAME+x} ]; then
+        echo "No image specified??????????????"
+        exit 1
+      else
+        VAR_BLOB=$(echo "$VAR_BLOB" | jq --compact-output '.variables += {"TARGET_IMAGE_PATH":"'"${CONTAINER_IMAGE}"'"}')
+      fi
+
+    - VAR_BLOB=$(echo "$VAR_BLOB" | jq --compact-output '.variables += {"TARGET_IMAGE_HASH":"'"${CI_COMMIT_SHA_SHORT}"'"}')
+    - |
+      if [ ! -z ${IMAGE_LABEL+x} ]; then
+        VAR_BLOB=$(echo "$VAR_BLOB" | jq --compact-output '.variables += {"TARGET_IMAGE_LABEL":"'"${IMAGE_LABEL}"'"}')
+      fi
+
+    - |
+      echo "${VAR_BLOB}"
+      curl -X POST -H 'Content-Type: application/json' -d "${VAR_BLOB}" "${CI_GITLAB_API_URL}/api/v4/projects/${PROJECT_ID}/trigger/pipeline" | jq '.'
+
+
+shim_dataviz:
+  extends: .shim_trigger
+  variables:
+    IMAGE_LABEL: "R/Dataviz"
+    CONTAINER_NAME: singleuser-dataviz
+
+
+#  _____ ____  ___ ____  ____ _____ ____     _   _ _______  _______ 
+# |_   _|  _ \|_ _/ ___|/ ___| ____|  _ \   | \ | | ____\ \/ /_   _|
+#   | | | |_) || | |  _| |  _|  _| | |_) |  |  \| |  _|  \  /  | |  
+#   | | |  _ < | | |_| | |_| | |___|  _ <   | |\  | |___ /  \  | |  
+#   |_| |_| \_\___\____|\____|_____|_| \_\  |_| \_|_____/_/\_\ |_|  
+
+
+# trigger_next_branch:
+#   stage: L98
+#   image: ${CI_REGISTRY}/jupyter/util/util-container
+#   variables:
+#     # WTF gitlab, why does this not exist
+#     CI_GITLAB_API_URL: https://XXXXXXX.edu
+#     # REPOSITORY: jupyter/docker-stacks
+#     PROJECT_ID: 34
+#   when: manual
+#   allow_failure: true
+#   before_script:
+#     # - export IMAGE_PATH="${CI_REGISTRY}/${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}"
+#     # NO REGISTRY!
+#     - export IMAGE_PATH="${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}"
+#     - export CONTAINER_IMAGE="${IMAGE_PATH}/${CONTAINER_NAME}"
+#     - export CI_COMMIT_SHA_SHORT="${CI_COMMIT_SHA:0:8}"
+#     # - export CI_COMMIT_BEFORE_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
+#   script:
+#     - |
+#       if [ "${CI_COMMIT_REF_NAME}" = "test" ]; then
+#         export TARGET_CYCLE="prod"
+#       elif [ "${CI_COMMIT_REF_NAME}" = "dev" ]; then
+#         export TARGET_CYCLE="test"
+#       else
+#         echo "Nothing to do!"
+#         exit 0
+#       fi
+
+#     - VAR_BLOB=$(echo '{"token":"'"${CI_JOB_TOKEN}"'", "ref":"'"${TARGET_CYCLE}"'"}')
+
+#     - VAR_BLOB=$(echo "$VAR_BLOB" | jq --compact-output '.variables += {"CACHE":"'"$CACHE"'"}')
+
+#     - |
+#       curl -X POST -H 'Content-Type: application/json' -d "${VAR_BLOB}" "${CI_GITLAB_API_URL}/api/v4/projects/${PROJECT_ID}/trigger/pipeline" | jq '.'
