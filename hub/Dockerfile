@@ -1,5 +1,7 @@
 FROM ubuntu:18.04
 
+ARG JUPYTERHUB_VERSION=0.9.*
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       git \
@@ -7,10 +9,12 @@ RUN apt-get update && \
       python3-dev \
       python3-pip \
       python3-setuptools \
-      libcurl4-openssl-dev \
-      libssl-dev \
+      python3-pycurl \
       build-essential \
       sqlite3 \
+      $(bash -c 'if [[ $JUPYTERHUB_VERSION == "git"* ]]; then \
+        echo npm; \
+      fi') \
       && \
     apt-get purge && apt-get clean
 
@@ -27,13 +31,22 @@ RUN adduser --disabled-password \
     --force-badname \
     ${NB_USER}
 
-ARG JUPYTERHUB_VERSION=0.9.*
+ARG DEPLOY_USER=XXXXXXXX
+ARG DEPLOY_KEY=XXXXXXXX
 
 ADD requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir \
-         jupyterhub==${JUPYTERHUB_VERSION} \
-         git+https://github.com/vilhelmen/ldapauthenticator.git@jh-0.9.4-compat \
-         -r /tmp/requirements.txt
+         -r /tmp/requirements.txt \
+         $(bash -c 'if [[ $JUPYTERHUB_VERSION == "git"* ]]; then \
+            echo ${JUPYTERHUB_VERSION}; \
+          else \
+            echo jupyterhub==${JUPYTERHUB_VERSION}; \
+          fi') \
+         git+https://${DEPLOY_USER}:${DEPLOY_KEY}@github.com/vilhelmen/ldapauthenticator.git@jh-0.9.4-compat
+
+#ADD patch1 /tmp/patch1
+#ADD patch2 /tmp/patch2
+#RUN cd /usr/local/lib/python3.6/dist-packages/jupyterhub && patch -p2 < /tmp/patch1 && patch -p2 < /tmp/patch2
 
 ADD jupyterhub_config.py /srv/jupyterhub_config.py
 

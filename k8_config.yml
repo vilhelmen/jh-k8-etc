@@ -1,41 +1,186 @@
+proxy:
+  secretToken: 'XXXXXXXXXXX'
+  service:
+    loadBalancerIP: XXX.XXX.XXX.XXX
+  https:
+    enabled: true
+    type: manual
+    hosts:
+      - XXXXXXX.edu
+    manual:
+      # I HAVE NO IDEA HOW TO WORK INGRESS
+      key: |
+        -----BEGIN PRIVATE KEY-----
+        -----END PRIVATE KEY-----
+      cert: |
+        -----BEGIN CERTIFICATE-----
+        -----END CERTIFICATE-----
+
 hub:
   image:
-    name: CUSTOM_HUB_IMAGE
-    tag: XXXX
+    name: 'XXXX/jupyter/zero-to-jupyterhub-k8s/dev/hub'
+    tag: 'latest'
+  # You probably don't want latest and always pull on a prod server
+  imagePullPolicy: Always
+  imagePullSecret:
+    enabled: True
+    password: XXXXXX
+    username: XXXX
+    registry: https://XXXXXXXX
+  # Our nodes are labled CPU and GPU for basic session routing
+  labels:
+    workset: cpu
+  extraConfig:
+    # Append a debug image to the list that is not pulled by the awaiter for easier/faster dev work
+    1: |
+       c.KubeSpawner.profile_list.append({'display_name': 'Debug Image', 'kubespawner_override': {'image': 'XXXXXX/jupyter/docker-stacks/dev/singleuser-dev:latest-shim'}})
+  # Special setting for git server auto-trust
+  spawner:
+    git_server: 'XXXXXX'
 
 singleuser:
+  cmd: null
   image:
-    name: SINGLEUSER_IMAGE
-    tag: XXXX
+    name: 'XXXXXXXX/jupyter/docker-stacks/dev/singleuser-minimal'
+    tag: 'latest-shim'
+  imagePullPolicy: Always
+  imagePullSecret:
+    enabled: True
+    password: XXXXXX
+    username: XXXXXX
+    registry: https://XXXXXXX
+  networkTools:
+    # Hardcoded because we're runnign 0.8-dev and every tag is "generated-by-chartpress" right now
+    image:
+      tag: 0.7.0
+  storage:
+    # No PVCs, SIGNIFICANTLY SPEEDS UP STARTUP
+    type: none
+    # homedirs are mounted on the cluster nodes and passed through
+    extraVolumes:
+      - name: 'home-{username}'
+        hostPath:
+          path: '/dsa-dev/home/{username}'
+      - name: 'data'
+        hostPath:
+          path: '/dsa/data'
+      - name: 'scripts'
+        hostPath:
+          path: '/dsa-dev/scripts'
+    extraVolumeMounts:
+      - name: 'home-{username}'
+        mountPath: '/dsa/home/{username}'
+      - name: 'data'
+        mountPath: '/dsa/data'
+        readOnly: True
+      - name: 'scripts'
+        mountPath: '/dsa/scripts'
+        readOnly: True
+
+  profileList:
+   -  display_name: 'Datascience'
+      default: True
+      kubespawner_override:
+        image: 'XXXXXXXX/jupyter/docker-stacks/dev/singleuser-datascience:latest-shim'
+        cpu_limit: 2
+        mem_limit: '4G'
+        node_selector:
+          workset: cpu
+   -  display_name: 'R/Dataviz'
+      default: False
+      kubespawner_override:
+        image: 'XXXXXXXX/jupyter/course-containers/dev/singleuser-dataviz:latest-shim'
+        cpu_limit: 2
+        mem_limit: '4G'
+        node_selector:
+          workset: cpu
+   -  display_name: 'Minimal'
+      default: False
+      kubespawner_override:
+        image: 'XXXXXXXX/jupyter/docker-stacks/dev/singleuser-minimal:latest-shim'
+        cpu_limit: 2
+        mem_limit: '4G'
+        node_selector:
+          workset: cpu
+   -  display_name: 'R'
+      default: False
+      kubespawner_override:
+        image: 'XXXXXXXX/jupyter/docker-stacks/dev/singleuser-r:latest-shim'
+        cpu_limit: 2
+        mem_limit: '4G'
+        node_selector:
+          workset: cpu
+   -  display_name: 'Allspark'
+      default: False
+      kubespawner_override:
+        image: 'XXXXXXXX/jupyter/docker-stacks/dev/singleuser-allspark:latest-shim'
+        cpu_limit: 2
+        mem_limit: '4G'
+        node_selector:
+          workset: cpu
+   -  display_name: 'Tensorflow-CPU'
+      default: False
+      kubespawner_override:
+        image: 'XXXXXXXX/jupyter/docker-stacks/dev/singleuser-tf:latest-shim'
+        cpu_limit: 2
+        mem_limit: '4G'
+        node_selector:
+          workset: cpu
+   -  display_name: 'Tensorflow-GPU'
+      default: False
+      kubespawner_override:
+        image: 'XXXXXXXX/jupyter/docker-stacks/dev/singleuser-tf-gpu:latest-shim'
+        cpu_limit: 4
+        mem_limit: '16G'
+        extra_resource_guarantees:
+          nvidia.com/gpu: 1
+        extra_resource_limits:
+          nvidia.com/gpu: 1
+        node_selector:
+          workset: gpu
+
+prePuller:
+  hook:
+    image:
+      tag: 0.7.0
+
+debug:
+  enabled: true
 
 auth:
   type: 'ldap'
   state:
     enabled: true
-    cryptoKey: 'XXXXXXXXX'
+    cryptoKey: 'XXXXXXXX'
   ldap:
     server:                   
-      host: 'XXXXXXXX'
+      host: 'XXXXXXXX.edu'
       port: 3268
       ssl: false
-#    whitelistGroups: nil
+    whitelistGroups:
+     - 'CN=USERS,DC=edu'
+# blacklist non-functional in 0.9.4-compat version
 #    blacklistGroups: nil
-    adminGroups: ['CN=admins,DC=XXXX']
+    adminGroups:
+      - 'CN=ADMINS,DC=edu'
+      - 'CN=TAS,DC=edu'
+      - 'CN=INSTRUCTORS,DC=edu'
     user:
-#      validRegex:
+      # Someone tried an uppercase name and got smacked down
+      validRegex: '^[a-zA-Z][.a-zA-Z0-9_-]*$'
       search:
         base: ''
         uid: 'sAMAccountName'
         filter: '({username_attribute}={username})'
-        dn: 'CN=ldap_ro,CN=XXXXXXX'
+        dn: 'CN=LDAPRO,DC=edu'
         password: 'XXXXXXXX'
     profile:
       enable: true
       groups:
-        - 'CN=users,DC=XXXXXXX'
-        - 'CN=tas,DC=XXXXXXX'
-        - 'CN=adminsDC=XXXXXXXX'
-        - 'CN=instructors,DC=XXXXXX'
+        - 'CN=USERS,DC=edu'
+        - 'CN=TAS,DC=edu'
+        - 'CN=ADMINS,DC=edu'
+        - 'CN=INSTRUCTORS,DC=edu'
       uid: 'uidNumber'
-      gid: 'gidNumber' # May be problematic! Should default to uidNumber to be safe because CERTAIN NODES are bad at ldap
+      gid: 'gidNumber'
       groupName: 'cn'

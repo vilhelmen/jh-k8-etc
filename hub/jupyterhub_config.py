@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 
 from tornado.httpclient import AsyncHTTPClient
 from kubernetes import client
@@ -125,6 +126,7 @@ for trait, cfg_key in (
     ('extra_resource_limits', 'extraResource.limits'),
     ('extra_resource_guarantees', 'extraResource.guarantees'),
     ('environment', 'extraEnv'),
+    ('profile_list', None),
 ):
     if cfg_key is None:
         cfg_key = camelCaseify(trait)
@@ -136,7 +138,7 @@ if image:
     if tag:
         image = "{}:{}".format(image, tag)
 
-    c.KubeSpawner.image_spec = image
+    c.KubeSpawner.image = image
 
 if get_config('singleuser.imagePullSecret.enabled'):
     c.KubeSpawner.image_pull_secrets = 'singleuser-image-credentials'
@@ -236,10 +238,6 @@ c.KubeSpawner.volume_mounts.extend(get_config('singleuser.storage.extraVolumeMou
 set_config_if_not_none(c.KubeSpawner, 'lifecycle_hooks', 'singleuser.lifecycleHooks')
 
 # Gives spawned containers access to the API of the hub
-# FIXME: KubeSpawner duplicate hub_connect config should be deprecated and removed
-c.KubeSpawner.hub_connect_ip = os.environ['HUB_SERVICE_HOST']
-c.KubeSpawner.hub_connect_port = int(os.environ['HUB_SERVICE_PORT'])
-
 c.JupyterHub.hub_connect_ip = os.environ['HUB_SERVICE_HOST']
 c.JupyterHub.hub_connect_port = int(os.environ['HUB_SERVICE_PORT'])
 
@@ -428,82 +426,77 @@ if get_config('debug.enabled', False):
     c.Spawner.debug = True
 
 
-for key, config_py in sorted(get_config('hub.extraConfig', {}).items()):
+extra_config = get_config('hub.extraConfig', {})
+if isinstance(extra_config, str):
+    from textwrap import indent, dedent
+    msg = dedent(
+    """
+    hub.extraConfig should be a dict of strings,
+    but found a single string instead.
+
+    The keys can be anything identifying the
+    block of extra configuration.
+
+    Try this instead:
+
+        hub:
+          extraConfig:
+            myConfig: |
+              {}
+    """
+    )
+    print(
+        msg.format(
+            indent(extra_config, ' ' * 10).lstrip()
+        ),
+        file=sys.stderr
+    )
+    extra_config = {'deprecated string': extra_config}
+
+for key, config_py in sorted(extra_config.items()):
+    print("Loading extra config: %s" % key)
     exec(config_py)
 
 
-
-import subprocess
 from tornado import gen
+
+spawner_git_server = get_config('hub.spawner.git_server')
 
 @gen.coroutine
 def spawner_config(spawner):
-    """
-    We are running ON THE HUB! Need to configure the mounts and stuff for the end user.
+  """
+  We are running ON THE HUB! Need to configure the mounts and stuff for the end user.
 
-    The startup scripts will have to do the rest.
+  The startup scripts will have to do the rest.
 
-    1. Setup mounts and owners and paths and IDs
-    2. Pass data off to the container for build (spawner.environment dict)
-    """
-    auth_state = yield spawner.user.get_auth_state()
+  1. Setup mounts and owners and paths and IDs
+  2. Pass data off to the container for build (spawner.environment dict)
+  """
+  auth_state = yield spawner.user.get_auth_state()
 
-    # TODO: volumes can be moved to the helm config file
-    # (skel init handled by my internal user ingestion service)
-    # (But the usual pre_spawn_hook call to mkhomedir_helper would work)
+  # Entrypoint of root seems to get smashed by this. Duh. Whoops.
+  spawner.uid = 0
+  spawner.gid = 0
 
-    spawner.volumes.append({
-            'name': 'home-{username}',
-            'hostPath': {'path': '/dsa/home/{username}'}
-        })
-    spawner.volume_mounts.append({
-            'name': 'home-{username}',
-            'mountPath': '/home/{username}'
-        })
+  #spawner.uid = auth_state['profile']['uid']
+  #spawner.gid = auth_state['profile']['gid']
+  spawner.fs_gid = auth_state['profile']['gid'] # I still don't get this one
+  spawner.supplemental_gids = auth_state['profile']['group_membership']
+  spawner.environment['NB_USER'] = spawner.user.name
+  spawner.environment['NB_UID'] = str(auth_state['profile']['uid'])
+  spawner.environment['NB_GID'] = str(auth_state['profile']['gid'])
 
-    spawner.volumes.append({
-            'name': 'data',
-            'hostPath': {'path': '/dsa/data'}
-        })
-    spawner.volume_mounts.append({
-            'name': 'data',
-            'mountPath': '/dsa/data',
-            'readOnly': True # Yay!
-        })
+  if spawner.user.admin:
+      spawner.environment['GRANT_SUDO'] = '1'
 
-    spawner.volumes.append({
-            'name': 'scripts',
-            'hostPath': {'path': '/dsa/scripts'}
-        })
-    spawner.volume_mounts.append({
-            'name': 'scripts',
-            'mountPath': '/dsa/scripts',
-            'readOnly': True # Yay!
-        })
+  # spawner.environment['GIT_SSH_HOST'] = 'git.dev.dsa.lan'
+  spawner.environment['GIT_SSH_HOST'] = spawner_git_server
 
-    # Entrypoint of root seems to get smashed by this. Duh. Whoops.
-    spawner.uid = 0
-    spawner.gid = 0
+  spawner.environment['NOTEBOOK_DIR'] = '/home/{username}/jupyter'.format(username=spawner.user.name)                                                                              
 
-    #spawner.uid = auth_state['profile']['uid']
-    #spawner.gid = auth_state['profile']['gid']
-    spawner.fs_gid = auth_state['profile']['gid'] # I still don't get this one. I think it's for NEW data mounts
-    spawner.supplemental_gids = list(auth_state['profile']['group_map'].keys()) # (includes primary gid)
+  spawner.environment['GROUP_BUILD'] = ' '.join([':'.join([v, str(k)]) for k, v in auth_state['profile']['group_map'].items()])                                                    
+  spawner.environment['GROUP_MEMBER'] = ' '.join([str(x) for x in auth_state['profile']['group_membership']])                                                                      
 
-    # Helm chart is RUDE and sets the singleuser cmd silently.
-    # can override in config yaml, but I'm going to force it here
-    # and make instructors not override the entrypoint in their containers
-    spawner.cmd = None
-
-    spawner.environment['NB_USER'] = spawner.user.name
-    spawner.environment['NB_UID'] = str(auth_state['profile']['uid'])
-    spawner.environment['NB_GID'] = str(auth_state['profile']['gid'])
-
-    # spawner.environment['NOTEBOOK_DIR'] = '/home/{username}'.format(username=spawner.user.name)
-    # Not needed, fixed by dumb start.sh changes
-
-    spawner.environment['GROUP_BUILD'] = ' '.join([':'.join([v, str(k)]) for k, v in auth_state['profile']['group_map'].items()])
-
-    return
+  return
 
 c.Spawner.pre_spawn_hook = spawner_config
