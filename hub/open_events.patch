@@ -1,0 +1,13 @@
+diff --git a/share/jupyterhub/templates/spawn_pending.html b/share/jupyterhub/templates/spawn_pending.html
+index ad6a6e4..e058e89 100644
+--- a/share/jupyterhub/templates/spawn_pending.html
++++ b/share/jupyterhub/templates/spawn_pending.html
+@@ -19,7 +19,7 @@
+   </div>
+   <div class="row">
+     <div class="col-md-8 col-md-offset-2">
+-      <details id="progress-details">
++      <details id="progress-details" open="true">
+         <summary>Event log</summary>
+         <div id="progress-log"></div>
+       </details>

@@ -90,12 +90,13 @@ scheduling:
       fi
     - export CI_COMMIT_SHA_SHORT="${CI_COMMIT_SHA:0:8}"
     - export CI_COMMIT_BEFORE_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
-    - |
-      if [ ! -z ${PARENT_TAG+x} ]; then
-        export CI_PARENT_TAG="${PARENT_TAG}"
-      else
-        export CI_PARENT_TAG='latest'
-      fi
+# This has no business being here right now and made things a mess. Resync with course-containers later.
+#    - |
+#      if [ ! -z ${PARENT_TAG+x} ]; then
+#        export CI_PARENT_TAG="${PARENT_TAG}"
+#      else
+#        export CI_PARENT_TAG='latest'
+#      fi
 
 
 .build:
@@ -105,10 +106,10 @@ scheduling:
     - |
       if [ "${CACHE}" = "YES" ]; then
         docker pull ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} || true
-        docker pull ${CONTAINER_IMAGE}:${CI_PARENT_SHA_SHORT} || true
+        docker pull ${CONTAINER_IMAGE}:${CI_COMMIT_BEFORE_SHA_SHORT} || true
         docker pull ${CONTAINER_IMAGE}:latest || true
         #if [ ! -z ${PARENT_IMAGE+x} ]; then
-        #  docker pull ${PARENT_IMAGE}:${CI_PARENT_TAG} || true
+        #  docker pull ${PARENT_IMAGE}:${CI_COMMIT_SHA_SHORT} || true
         #  docker pull ${PARENT_IMAGE}:latest || true
         #fi
 
@@ -118,14 +119,14 @@ scheduling:
         fi
       fi
       if [ ! -z ${PARENT_NAME+x} ]; then
-        docker pull ${PARENT_IMAGE}:${CI_PARENT_TAG}
+        docker pull ${PARENT_IMAGE}:${CI_COMMIT_SHA_SHORT}
       fi
     # Build main image
     - |
       echo 'docker build \' > image_build
       if [ "${CACHE}" = "YES" ]; then
         echo " --cache-from ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} \\" >> image_build
-        echo " --cache-from ${CONTAINER_IMAGE}:${CI_PARENT_SHA_SHORT} \\" >> image_build
+        echo " --cache-from ${CONTAINER_IMAGE}:${CI_COMMIT_BEFORE_SHA_SHORT} \\" >> image_build
         echo " --cache-from ${CONTAINER_IMAGE}:latest \\" >> image_build
         if [ ! -z ${PREV_CYCLE_CONTAINER_IMAGE+x} ]; then
           echo "--cache-from ${PREV_CYCLE_CONTAINER_IMAGE}:latest \\" >> image_build
@@ -135,7 +136,7 @@ scheduling:
       fi
 
       if [ ! -z ${PARENT_NAME+x} ]; then
-        echo " --build-arg BASE_CONTAINER=${PARENT_IMAGE}:${CI_PARENT_TAG} \\" >> image_build
+        echo " --build-arg BASE_CONTAINER=${PARENT_IMAGE}:${CI_COMMIT_SHA_SHORT} \\" >> image_build
       fi
 
       echo " --tag ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} ${CONTAINER_PATH}/" >> image_build
@@ -164,7 +165,7 @@ build_base:
     - |
       if [ "${CACHE}" = "YES" ]; then
         docker pull ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} || true
-        docker pull ${CONTAINER_IMAGE}:${CI_PARENT_SHA_SHORT} || true
+        docker pull ${CONTAINER_IMAGE}:${CI_COMMIT_BEFORE_SHA_SHORT} || true
         docker pull ${CONTAINER_IMAGE}:latest || true
 
         # Load previous cycle image
@@ -181,7 +182,7 @@ build_base:
       echo 'docker build \' > image_build
       if [ "${CACHE}" = "YES" ]; then
         echo " --cache-from ${CONTAINER_IMAGE}:${CI_COMMIT_SHA_SHORT} \\" >> image_build
-        echo " --cache-from ${CONTAINER_IMAGE}:${CI_PARENT_SHA_SHORT} \\" >> image_build
+        echo " --cache-from ${CONTAINER_IMAGE}:${CI_COMMIT_BEFORE_SHA_SHORT} \\" >> image_build
         echo " --cache-from ${CONTAINER_IMAGE}:latest \\" >> image_build
         if [ ! -z ${PREV_CYCLE_CONTAINER_IMAGE+x} ]; then
           echo "--cache-from ${PREV_CYCLE_CONTAINER_IMAGE}:latest \\" >> image_build
@@ -654,11 +655,10 @@ clean_allspark:
     # WTF gitlab, why does this not exist
     CI_GITLAB_API_URL: https://XXXXX.edu
     PROJECT_ID: 33
-    IMAGE_LABEL: "UNLABELD CONTAINER IMAGE 🚱"
   before_script:
     - export CONTAINER_IMAGE="${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}/${CONTAINER_NAME}"
     - export CI_COMMIT_SHA_SHORT="${CI_COMMIT_SHA:0:8}"
-    # - export CI_PARENT_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
+    # - export CI_COMMIT_BEFORE_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
   script:
     - VAR_BLOB=$(echo '{"token":"'"${CI_JOB_TOKEN}"'", "ref":"'"${CI_COMMIT_REF_NAME}"'"}')
 
@@ -747,7 +747,7 @@ shim_tf_gpu:
     - export IMAGE_PATH="${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}"
     - export CONTAINER_IMAGE="${IMAGE_PATH}/${CONTAINER_NAME}"
     - export CI_COMMIT_SHA_SHORT="${CI_COMMIT_SHA:0:8}"
-    # - export CI_PARENT_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
+    # - export CI_COMMIT_BEFORE_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
   script:
     - VAR_BLOB=$(echo '{"token":"'"${CI_JOB_TOKEN}"'", "ref":"'"${CI_COMMIT_REF_NAME}"'"}')
 
@@ -785,7 +785,7 @@ trigger_courses:
 #     - export IMAGE_PATH="${CI_PROJECT_PATH}/${CI_COMMIT_REF_NAME}"
 #     - export CONTAINER_IMAGE="${IMAGE_PATH}/${CONTAINER_NAME}"
 #     - export CI_COMMIT_SHA_SHORT="${CI_COMMIT_SHA:0:8}"
-#     # - export CI_PARENT_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
+#     # - export CI_COMMIT_BEFORE_SHA_SHORT="${CI_COMMIT_BEFORE_SHA:0:8}"
 #   script:
 #     - |
 #       if [ "${CI_COMMIT_REF_NAME}" = "test" ]; then

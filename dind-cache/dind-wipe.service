@@ -1,0 +1,6 @@
+[Unit]
+Description=DIND Cleanup Job
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart dind-cache.service

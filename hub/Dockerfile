@@ -44,9 +44,8 @@ RUN pip3 install --no-cache-dir \
           fi') \
          git+https://${DEPLOY_USER}:${DEPLOY_KEY}@github.com/vilhelmen/ldapauthenticator.git@jh-0.9.4-compat
 
-#ADD patch1 /tmp/patch1
-#ADD patch2 /tmp/patch2
-#RUN cd /usr/local/lib/python3.6/dist-packages/jupyterhub && patch -p2 < /tmp/patch1 && patch -p2 < /tmp/patch2
+ADD open_events.patch /tmp/
+RUN patch /usr/local/share/jupyterhub/templates/spawn_pending.html /tmp/open_events.patch
 
 ADD jupyterhub_config.py /srv/jupyterhub_config.py
 

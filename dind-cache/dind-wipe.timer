@@ -1,0 +1,8 @@
+[Unit]
+Description=DIND Cleanup Timer
+
+[Timer]
+OnUnitActiveSec=1w
+
+[Install]
+WantedBy=timers.target

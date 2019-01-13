@@ -1,0 +1,14 @@
+#!/bin/bash
+
+SESSION=$1
+
+if [ -z "$SESSION" ]; then
+  echo "Target not specified!"
+  exit 1
+fi
+
+echo uggh version numbers aaaaaaa
+
+echo "helm upgrade --timeout 600 --install jhub-${SESSION} --namespace jhub-${SESSION} --values ${SESSION}-config.yaml --version 0.8-dev test_chart/jupyterhub-${SESSION}"
+
+helm upgrade --timeout 600 --install "jhub-${SESSION}" --namespace "jhub-${SESSION}" --values "${SESSION}-config.yaml" --version 0.8-dev "test_chart/jupyterhub-${SESSION}"

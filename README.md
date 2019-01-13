@@ -30,3 +30,14 @@ Rough inventory of the things it does:
 1. user prep: applies all the homedir weirdness to make things work smoothly. We allow the user to place a .jupyter directory in their ~/jupyter directory to load user configuration, and we also load a ~/jupyter/.bashrc. Everything is symlinks due to rootquash. Wipes sudo identifiers in the bash session because conda is busted.
 
 1. Patch notebook server before boot: Basic metrics. If you squint hard enough, you could consider the number of cells run in an assignment notebook to be related to difficulty.
+
+
+dind-cache is the system for making dind a little less terrible. This sets up a shared dind image used by all container builds. This prevents images being pulled EVERY SINGLE CI PHASE and saves A LOT of time. It's a little touchy. There's a timer to stop gitlab-ci and the dind cache every once in awhile because dind will continue to suck up disk space until it breaks something. Our CI server is setup to prioritize volume storage over image storage, as the dind cache stores images as volumes.
+
+**DO NOT STORE YOUR VOLUMES ON XFS ON CENTOS** We consistently hit an XFS deadlock in kernel 3-whatever. It's a known issue(?) and is supposedly fixed in kernel 4. Maybe in 2040 centos will hit kernel 4.2.
+
+helm-control is just a bit of tmux scripts to make my life a little easier.
+
+util-container is just the util container used in ci. nothing special whatsoever.
+
+docker-stacks has the tensorflow GPU/CPU patches used by the build system.

@@ -155,6 +155,8 @@ shim:
         echo " --build-arg IMAGE_LABEL='${TARGET_IMAGE_LABEL}' \\" >> image_build
       fi
 
+      echo " --build-arg LABEL_STYLE='${CI_COMMIT_REF_NAME}' \\" >> image_build
+
       echo " --build-arg BASE_CONTAINER=${TARGET_IMAGE}:latest \\" >> image_build
       echo " --tag ${TARGET_IMAGE}:${TARGET_IMAGE_HASH}-shim \\" >> image_build
       echo " --tag ${TARGET_IMAGE}:latest-shim \\" >> image_build

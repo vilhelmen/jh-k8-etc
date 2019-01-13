@@ -1,0 +1,15 @@
+[Unit]
+Description=DIND master cache service
+Requires=docker.service
+BindsTo=docker.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/sh -c "docker network inspect dind-net > /dev/null || docker network create dind-net"
+ExecStart=/usr/bin/docker run --rm --network dind-net --privileged --name dind-cache --network-alias docker docker:dind --storage-driver=overlay2 --bip=10.10.0.1/24
+ExecStopPost=/usr/bin/docker volume prune -f
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

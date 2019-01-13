@@ -1,0 +1,16 @@
+--- base-notebook/Dockerfile	2018-12-09 16:23:19.000000000 -0600
++++ nvidia-tensorflow/base-notebook/Dockerfile	2018-12-13 18:19:17.000000000 -0600
+@@ -77,6 +78,13 @@
+     fix-permissions $CONDA_DIR && \
+     fix-permissions /home/$NB_USER
+ 
++# tensorflow or tensorflow-gpu
++ARG TENSORFLOW_PKG=tensorflow
++RUN conda install --quiet --yes -c conda-forge $TENSORFLOW_PKG && \
++    conda clean -tipsy && \
++    rm -rf /home/$NB_USER/.cache/yarn && \
++    fix-permissions $CONDA_DIR
++
+ # Install Tini
+ RUN conda install --quiet --yes 'tini=0.18.0' && \
+     conda list tini | grep tini | tr -s ' ' | cut -d ' ' -f 1,2 >> $CONDA_DIR/conda-meta/pinned && \

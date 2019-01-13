@@ -1,0 +1,10 @@
+#!/bin/bash
+
+SESSION=$1
+
+if [ -z "$SESSION" ]; then
+  echo "Target not specified!"
+  exit 1
+fi
+
+kubectl delete namespace "jhub-${SESSION}"
