@@ -1,5 +1,5 @@
 diff --git a/notebook/services/kernels/handlers.py b/notebook/services/kernels/handlers.py
-index cfef2a4a0..2dcf9be90 100644
+index cfef2a4a0..611fab048 100644
 --- a/notebook/services/kernels/handlers.py
 +++ b/notebook/services/kernels/handlers.py
 @@ -329,6 +329,9 @@ class ZMQChannelsHandler(AuthenticatedZMQStreamHandler):
@@ -7,7 +7,7 @@ index cfef2a4a0..2dcf9be90 100644
          msg_type = msg['header']['msg_type']
  
 +        if msg_type == 'execute_input':
-+            self.log.critical("TRAK: %s", json.dumps({'who': msg['header']['username'], 'where': self.session_manager.get_session(kernel_id=self.kernel_id)['path'], 'when': str(msg['header']['date'])}))
++            self.log.critical("TRAK: %s", json.dumps({'who': msg['header']['username'], 'what': msg['content']['code'], 'where': self.session_manager.get_session(kernel_id=self.kernel_id)['path'], 'when': str(msg['header']['date'])}))
 +
          if channel == 'iopub' and msg_type == 'status' and msg['content'].get('execution_state') == 'idle':
              # reset rate limit counter on status=idle,
